@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Blocket.se Volvo V90 monitor – posílá Telegram notifikace pro nové inzeráty."""
+"""Blocket.se Volvo V90 monitor – Playwright scraping + Telegram notifikace."""
 
-import requests
+import json
 import sys
+import re
 from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = "8796100241:AAHZpaeWLqHAEZX6Sa855sNhapO3g1LIZUA"
@@ -18,19 +19,42 @@ ACCEPTED_TRANSMISSIONS = ["automat", "automatisk", "geartronic"]
 
 
 def fetch_listings():
-    url = "https://api.blocket.se/search_bff/v1/content"
-    params = {
-        "q": "volvo v90", "cg": "1020", "w": "3", "st": "s",
-        "c": "1020", "ca": "11", "is": "1", "lim": "60",
-        "mj": str(MIN_YEAR), "xp": str(MAX_PRICE_SEK),
-    }
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
-    }
-    r = requests.get(url, params=params, headers=headers, timeout=30)
-    r.raise_for_status()
-    return r.json().get("data", [])
+    from playwright.sync_api import sync_playwright
+
+    url = (
+        "https://www.blocket.se/annonser/hela_sverige/fordon/bilar"
+        "?q=volvo+v90&mj=2020&xp=270000&cg=1020&ca=11"
+    )
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            locale="sv-SE",
+        )
+
+        # Zachyť JSON odpověď z API
+        captured = []
+
+        def on_response(response):
+            if "api.blocket.se/search_bff" in response.url and response.status == 200:
+                try:
+                    data = response.json()
+                    if "data" in data:
+                        captured.extend(data["data"])
+                except Exception:
+                    pass
+
+        page.on("response", on_response)
+        page.goto(url, wait_until="networkidle", timeout=30000)
+        browser.close()
+
+    if captured:
+        print(f"  Zachyceno přes API: {len(captured)} inzerátů")
+        return captured
+
+    # Fallback – parsuj HTML
+    return []
 
 
 def get_param(listing, *keys):
@@ -48,7 +72,7 @@ def parse_mileage_km(value):
     if not digits:
         return None
     m = int(digits)
-    return m * 10 if m < 25000 else m  # Swedish mil → km if small number
+    return m * 10 if m < 25000 else m
 
 
 def is_new(listing):
@@ -65,7 +89,8 @@ def is_new(listing):
 
 
 def matches(listing):
-    if "v90" not in listing.get("subject", "").lower():
+    subject = listing.get("subject", "").lower()
+    if "v90" not in subject:
         return False, "není V90"
     year_s = get_param(listing, "modellår", "årsmodell", "år")
     if year_s:
@@ -83,14 +108,13 @@ def matches(listing):
     trans = get_param(listing, "växellåda", "transmission").lower()
     if trans and not any(t in trans for t in ACCEPTED_TRANSMISSIONS):
         return False, f"převodovka: {trans}"
-    mileage_raw = get_param(listing, "miltal", "körsträcka")
-    km = parse_mileage_km(mileage_raw)
+    km = parse_mileage_km(get_param(listing, "miltal", "körsträcka"))
     if km and km > MAX_MILEAGE_KM:
         return False, f"nájezd {km} km"
     return True, "OK"
 
 
-def analyze(listing, km, price, year_s):
+def analyze(listing, km, price):
     notes = []
     s = listing.get("subject", "").lower()
     if price:
@@ -108,7 +132,7 @@ def analyze(listing, km, price, year_s):
         elif km < 80000:
             notes.append(f"Nízký nájezd ({km:,} km).".replace(",", " "))
         elif km > 115000:
-            notes.append(f"Vyšší nájezd ({km:,} km) — doporučuji prověřit servisní historii.".replace(",", " "))
+            notes.append(f"Vyšší nájezd ({km:,} km) — prověř servisní historii.".replace(",", " "))
     if "t8" in s or "recharge" in s:
         notes.append("T8 Recharge je nejsilnější varianta V90 (390 hp) s PHEV pohonem.")
     elif "t6" in s:
@@ -117,17 +141,17 @@ def analyze(listing, km, price, year_s):
         notes.append("Cross Country má vyšší světlou výšku — vhodný i do mírného terénu.")
     if "awd" in s or "4wd" in s:
         notes.append("Pohon AWD — výhoda pro zimní provoz.")
-    return " ".join(notes[:3]) or "Nabídka splňuje všechna zadaná kritéria."
+    return " ".join(notes[:3]) or "Nabídka splňuje zadaná kritéria."
 
 
 def format_msg(listing):
+    import requests as req
     subject = listing.get("subject", "Volvo V90")
     price = (listing.get("price") or {}).get("value", 0)
     price_sek = f"{price:,}".replace(",", " ") if price else "neuvedeno"
     price_czk = f"{round(price * SEK_TO_CZK / 1000) * 1000:,}".replace(",", " ") if price else "—"
     year_s = get_param(listing, "modellår", "årsmodell", "år") or "neuvedeno"
-    mileage_raw = get_param(listing, "miltal", "körsträcka")
-    km = parse_mileage_km(mileage_raw)
+    km = parse_mileage_km(get_param(listing, "miltal", "körsträcka"))
     mileage_str = f"{km:,} km".replace(",", " ") if km else "neuvedeno"
     fuel = get_param(listing, "drivmedel", "bränsle") or "neuvedeno"
     effect = get_param(listing, "hästkrafter", "effekt")
@@ -140,11 +164,7 @@ def format_msg(listing):
     else:
         location_str = "neuvedeno"
     url = listing.get("ad_link") or listing.get("share_url") or "https://www.blocket.se"
-    try:
-        year = int("".join(c for c in year_s if c.isdigit())[:4])
-    except Exception:
-        year = 0
-    note = analyze(listing, km, price, year_s)
+    note = analyze(listing, km, price)
     return (
         f"🚗 <b>{subject}</b>\n\n"
         f"💰 <b>Cena:</b> {price_sek} SEK (~{price_czk} CZK)\n"
@@ -159,7 +179,8 @@ def format_msg(listing):
 
 
 def send_telegram(text):
-    r = requests.post(
+    import requests as req
+    r = req.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
         json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
         timeout=10,
@@ -168,17 +189,18 @@ def send_telegram(text):
 
 
 def main():
+    import requests  # noqa – import check
     print(f"UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
+
     try:
         listings = fetch_listings()
     except Exception as e:
         print(f"Chyba načítání: {e}", file=sys.stderr)
         sys.exit(1)
-    print(f"Nalezeno celkem: {len(listings)}")
 
+    print(f"Nalezeno celkem: {len(listings)}")
     matching = [l for l in listings if matches(l)[0]]
     print(f"Po filtrech: {len(matching)}")
-
     new = [l for l in matching if is_new(l)]
     print(f"Nových (posledních {HOURS_WINDOW} h): {len(new)}")
 
