@@ -1,60 +1,99 @@
 #!/usr/bin/env python3
 """Blocket.se Volvo V90 monitor – Playwright scraping + Telegram notifikace."""
 
-import json
 import sys
-import re
+import json
 from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = "8796100241:AAHZpaeWLqHAEZX6Sa855sNhapO3g1LIZUA"
 CHAT_ID = 5711350539
 HOURS_WINDOW = 13
 SEK_TO_CZK = 2.27
-
 MIN_YEAR = 2020
 MAX_PRICE_SEK = 270000
 MAX_MILEAGE_KM = 140000
 ACCEPTED_FUELS = ["bensin", "laddhybrid", "hybrid", "el/bensin", "bensin/el", "plug-in"]
 ACCEPTED_TRANSMISSIONS = ["automat", "automatisk", "geartronic"]
 
+SEARCH_URL = (
+    "https://www.blocket.se/annonser/hela_sverige/fordon/bilar"
+    "?q=volvo+v90&mj=2020&xp=270000&cg=1020&ca=11"
+)
+
 
 def fetch_listings():
     from playwright.sync_api import sync_playwright
 
-    url = (
-        "https://www.blocket.se/annonser/hela_sverige/fordon/bilar"
-        "?q=volvo+v90&mj=2020&xp=270000&cg=1020&ca=11"
-    )
-
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = browser.new_context(
             user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
             locale="sv-SE",
+            viewport={"width": 1280, "height": 800},
         )
+        page = context.new_page()
 
-        # Zachyť JSON odpověď z API
+        # Zachyť API odpovědi
         captured = []
+        api_urls = []
 
         def on_response(response):
-            if "api.blocket.se/search_bff" in response.url and response.status == 200:
-                try:
-                    data = response.json()
-                    if "data" in data:
-                        captured.extend(data["data"])
-                except Exception:
-                    pass
+            url = response.url
+            if "blocket.se" in url and response.status == 200:
+                api_urls.append(url)
+                if "search_bff" in url or "content" in url:
+                    try:
+                        data = response.json()
+                        if "data" in data and isinstance(data["data"], list):
+                            captured.extend(data["data"])
+                            print(f"  API zachyceno: {url[:80]} → {len(data['data'])} položek")
+                    except Exception:
+                        pass
 
         page.on("response", on_response)
-        page.goto(url, wait_until="networkidle", timeout=30000)
+
+        print(f"  Načítám: {SEARCH_URL}")
+        page.goto(SEARCH_URL, timeout=45000)
+        page.wait_for_timeout(8000)  # Počkej na JS rendering
+
+        print(f"  Zachycené API URL ({len(api_urls)}): {api_urls[:3]}")
+        print(f"  Zachyceno inzerátů přes API: {len(captured)}")
+
+        # Záloha – extrahuj z DOM
+        if not captured:
+            print("  Zkouším DOM extrakci...")
+            try:
+                # Hledej JSON data v script tazích
+                scripts = page.eval_on_selector_all(
+                    "script[type='application/json'], script[id]",
+                    "els => els.map(e => e.textContent)"
+                )
+                for s in scripts:
+                    if "list_time" in s or "ad_id" in s:
+                        try:
+                            data = json.loads(s)
+                            if isinstance(data, dict) and "data" in data:
+                                captured.extend(data["data"])
+                                print(f"  DOM script: nalezeno {len(data['data'])} inzerátů")
+                                break
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"  DOM extrakce selhala: {e}")
+
+            # Záloha 2 – extrahuj přímo z elementů na stránce
+            if not captured:
+                print("  Zkouším extrakci z HTML elementů...")
+                try:
+                    items = page.query_selector_all("article[data-cy], li[data-cy]")
+                    print(f"  Nalezeno article elementů: {len(items)}")
+                    for item in items[:5]:
+                        print(f"    - {item.get_attribute('data-cy')}: {item.inner_text()[:80]}")
+                except Exception as e:
+                    print(f"  Element extrakce: {e}")
+
         browser.close()
-
-    if captured:
-        print(f"  Zachyceno přes API: {len(captured)} inzerátů")
-        return captured
-
-    # Fallback – parsuj HTML
-    return []
+    return captured
 
 
 def get_param(listing, *keys):
@@ -136,16 +175,15 @@ def analyze(listing, km, price):
     if "t8" in s or "recharge" in s:
         notes.append("T8 Recharge je nejsilnější varianta V90 (390 hp) s PHEV pohonem.")
     elif "t6" in s:
-        notes.append("T6 nabízí solidní výkon při benzínovém provozu.")
+        notes.append("T6 nabízí solidní výkon.")
     if "cross country" in s:
-        notes.append("Cross Country má vyšší světlou výšku — vhodný i do mírného terénu.")
+        notes.append("Cross Country má vyšší světlou výšku.")
     if "awd" in s or "4wd" in s:
         notes.append("Pohon AWD — výhoda pro zimní provoz.")
     return " ".join(notes[:3]) or "Nabídka splňuje zadaná kritéria."
 
 
 def format_msg(listing):
-    import requests as req
     subject = listing.get("subject", "Volvo V90")
     price = (listing.get("price") or {}).get("value", 0)
     price_sek = f"{price:,}".replace(",", " ") if price else "neuvedeno"
@@ -158,11 +196,9 @@ def format_msg(listing):
     motor_str = f"{fuel}, {effect} hp" if effect else fuel
     drivetrain = get_param(listing, "drivning", "drift") or "neuvedeno"
     loc = listing.get("location", [])
-    if isinstance(loc, list) and loc:
-        parts = [l.get("name", "") for l in loc[:2] if isinstance(l, dict)]
-        location_str = ", ".join(p for p in parts if p) or "neuvedeno"
-    else:
-        location_str = "neuvedeno"
+    location_str = ", ".join(
+        l.get("name", "") for l in (loc[:2] if isinstance(loc, list) else []) if isinstance(l, dict) and l.get("name")
+    ) or "neuvedeno"
     url = listing.get("ad_link") or listing.get("share_url") or "https://www.blocket.se"
     note = analyze(listing, km, price)
     return (
@@ -179,8 +215,8 @@ def format_msg(listing):
 
 
 def send_telegram(text):
-    import requests as req
-    r = req.post(
+    import requests
+    r = requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
         json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
         timeout=10,
@@ -189,9 +225,8 @@ def send_telegram(text):
 
 
 def main():
-    import requests  # noqa – import check
+    import requests  # noqa
     print(f"UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
-
     try:
         listings = fetch_listings()
     except Exception as e:
@@ -212,7 +247,6 @@ def main():
             print(f"  Odesláno: {l.get('subject')}")
         except Exception as e:
             print(f"  Telegram chyba: {e}", file=sys.stderr)
-
     print(f"Odesláno notifikací: {sent}")
 
 
