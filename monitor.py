@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Blocket.se Volvo V90 monitor – Playwright scraping + Telegram notifikace."""
+"""Blocket.se Volvo V90 monitor – Playwright + JS extrakce."""
 
 import sys
 import json
@@ -15,68 +15,124 @@ MAX_MILEAGE_KM = 140000
 ACCEPTED_FUELS = ["bensin", "laddhybrid", "hybrid", "el/bensin", "bensin/el", "plug-in"]
 ACCEPTED_TRANSMISSIONS = ["automat", "automatisk", "geartronic"]
 
-SEARCH_URL = (
-    "https://www.blocket.se/annonser/hela_sverige/fordon/bilar"
-    "?q=volvo+v90&mj=2020&xp=270000&cg=1020&ca=11"
-)
-
 
 def fetch_listings():
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-            locale="sv-SE",
-            viewport={"width": 1280, "height": 800},
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
         )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            locale="sv-SE",
+            timezone_id="Europe/Stockholm",
+            viewport={"width": 1280, "height": 800},
+            extra_http_headers={
+                "Accept-Language": "sv-SE,sv;q=0.9,en;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-User": "?1",
+                "Sec-Fetch-Dest": "document",
+            },
+        )
+        # Skryj automatizaci
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        """)
         page = context.new_page()
 
         captured = []
+        raw_responses = []
 
         def on_response(response):
             url = response.url
             if "blocket.se" not in url:
                 return
             ct = response.headers.get("content-type", "")
-            if "json" not in ct:
-                return
-            try:
-                data = response.json()
-                # Hledej pole s inzeráty – různé formáty
-                listings = None
-                if isinstance(data, dict):
-                    for key in ["data", "ads", "items", "results", "listings"]:
-                        v = data.get(key)
-                        if isinstance(v, list) and v:
-                            listings = v
-                            break
-                    # Zkus rekurzivně
-                    if not listings and "hits" in data:
-                        listings = data["hits"]
-                elif isinstance(data, list):
-                    listings = data
-
-                if listings:
-                    first = listings[0] if listings else {}
-                    # Zkontroluj že to jsou opravdové inzeráty
-                    if any(k in first for k in ["ad_id", "subject", "list_time", "price"]):
-                        captured.extend(listings)
-                        print(f"  ✓ API: {url[:80]}")
-                        print(f"    → {len(listings)} inzerátů, první klíče: {list(first.keys())[:6]}")
-            except Exception:
-                pass
+            if "json" in ct:
+                raw_responses.append(url)
+                try:
+                    data = response.json()
+                    # Prohledej libovolnou strukturu
+                    def find_listings(obj, depth=0):
+                        if depth > 5:
+                            return []
+                        if isinstance(obj, list) and len(obj) > 0:
+                            first = obj[0]
+                            if isinstance(first, dict) and any(k in first for k in ["ad_id","subject","list_time"]):
+                                return obj
+                        if isinstance(obj, dict):
+                            for v in obj.values():
+                                result = find_listings(v, depth+1)
+                                if result:
+                                    return result
+                        return []
+                    found = find_listings(data)
+                    if found:
+                        captured.extend(found)
+                        print(f"  ✓ JSON: {url[:70]} → {len(found)} inzerátů")
+                except Exception:
+                    pass
 
         page.on("response", on_response)
 
-        print(f"  Načítám stránku...")
-        page.goto(SEARCH_URL, timeout=45000)
-        page.wait_for_timeout(12000)
+        # Přejdi nejprve na hlavní stránku
+        print("  Načítám homepage...")
+        page.goto("https://www.blocket.se/", wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(2000)
+
+        # Přejdi na vyhledávání
+        search_url = "https://www.blocket.se/mobility/search/car?q=volvo+v90&year_min=2020&price_max=270000&fuel=bensin,laddhybrid&gearbox=automat&limit=60"
+        print(f"  Načítám výsledky...")
+        page.goto(search_url, wait_until="domcontentloaded", timeout=40000)
+        page.wait_for_timeout(10000)
+
+        print(f"  JSON odpovědi: {len(raw_responses)}: {raw_responses[:3]}")
+        print(f"  Zachyceno inzerátů: {len(captured)}")
+
+        # Záloha – extrahuj z DOM pomocí JS
+        if not captured:
+            print("  Zkouším JS window variables...")
+            for var in ["__INITIAL_STATE__", "__REDUX_STATE__", "__APP_STATE__", "__data__"]:
+                try:
+                    data = page.evaluate(f"window['{var}']")
+                    if data:
+                        print(f"  Nalezena proměnná {var}")
+                        break
+                except Exception:
+                    pass
+
+            # Hledej JSON v script tazích
+            print("  Hledám JSON v script tazích...")
+            try:
+                scripts = page.eval_on_selector_all("script", "els => els.map(e => ({type: e.type, id: e.id, len: e.textContent.length}))")
+                relevant = [s for s in scripts if s.get("len", 0) > 100]
+                print(f"  Script tagy ({len(relevant)}): {relevant[:5]}")
+
+                for i, s in enumerate(scripts):
+                    if s.get("len", 0) > 500:
+                        content = page.eval_on_selector_all("script", f"els => els[{i}] ? els[{i}].textContent : ''")
+                        if content and content[0] and ("list_time" in content[0] or "ad_id" in content[0]):
+                            try:
+                                data = json.loads(content[0])
+                                print(f"  ✓ Nalezena data ve script tagu!")
+                                captured.append(data)
+                            except Exception:
+                                pass
+            except Exception as e:
+                print(f"  JS chyba: {e}")
+
+        # Screenshot pro diagnostiku
+        try:
+            page.screenshot(path="screenshot.png", full_page=False)
+            print("  Screenshot uložen")
+        except Exception:
+            pass
 
         browser.close()
-
-    print(f"  Celkem zachyceno: {len(captured)} inzerátů")
     return captured
 
 
@@ -142,9 +198,9 @@ def analyze(listing, km, price):
     s = listing.get("subject", "").lower()
     if price:
         if price < 210000:
-            notes.append("Cena výrazně pod průměrem trhu — stojí za pozornost.")
+            notes.append("Cena výrazně pod průměrem trhu.")
         elif price < 245000:
-            notes.append("Velmi dobrá cena pro tento model a rok.")
+            notes.append("Velmi dobrá cena pro tento model.")
         elif price < 265000:
             notes.append("Cena odpovídá tržní hodnotě.")
         else:
@@ -155,9 +211,9 @@ def analyze(listing, km, price):
         elif km < 80000:
             notes.append(f"Nízký nájezd ({km:,} km).".replace(",", " "))
         elif km > 115000:
-            notes.append(f"Vyšší nájezd ({km:,} km) — prověř servisní historii.".replace(",", " "))
+            notes.append(f"Vyšší nájezd — prověř servisní historii.")
     if "t8" in s or "recharge" in s:
-        notes.append("T8 Recharge je nejsilnější varianta V90 (390 hp) s PHEV pohonem.")
+        notes.append("T8 Recharge je nejsilnější varianta V90 s PHEV pohonem.")
     elif "t6" in s:
         notes.append("T6 nabízí solidní výkon.")
     if "cross country" in s:
@@ -218,9 +274,8 @@ def main():
         print(f"Chyba načítání: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Nalezeno celkem: {len(listings)}")
+    print(f"Nalezeno: {len(listings)} | Po filtrech: {len([l for l in listings if matches(l)[0]])}")
     matching = [l for l in listings if matches(l)[0]]
-    print(f"Po filtrech: {len(matching)}")
     new = [l for l in matching if is_new(l)]
     print(f"Nových (posledních {HOURS_WINDOW} h): {len(new)}")
 
