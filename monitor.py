@@ -29,11 +29,11 @@ def firecrawl_scrape(url: str) -> str:
     r = requests.post(
         "https://api.firecrawl.dev/v1/scrape",
         headers={"Authorization": f"Bearer {FIRECRAWL_API_KEY}"},
-        json={"url": url, "formats": ["html"], "onlyMainContent": False},
+        json={"url": url, "formats": ["rawHtml"], "onlyMainContent": False},
         timeout=60,
     )
     r.raise_for_status()
-    return r.json()["data"]["html"]
+    return r.json()["data"]["rawHtml"]
 
 
 def parse_listings(html: str) -> list[dict]:
