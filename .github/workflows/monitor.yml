@@ -1,0 +1,19 @@
+name: Blocket.se Volvo V90 Monitor
+
+on:
+  schedule:
+    - cron: '0 5,17 * * *'
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install requests
+      - name: Run monitor
+        run: python monitor.py
