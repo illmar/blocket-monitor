@@ -33,66 +33,50 @@ def fetch_listings():
         )
         page = context.new_page()
 
-        # Zachyť API odpovědi
         captured = []
-        api_urls = []
 
         def on_response(response):
             url = response.url
-            if "blocket.se" in url and response.status == 200:
-                api_urls.append(url)
-                if "search_bff" in url or "content" in url:
-                    try:
-                        data = response.json()
-                        if "data" in data and isinstance(data["data"], list):
-                            captured.extend(data["data"])
-                            print(f"  API zachyceno: {url[:80]} → {len(data['data'])} položek")
-                    except Exception:
-                        pass
+            if "blocket.se" not in url:
+                return
+            ct = response.headers.get("content-type", "")
+            if "json" not in ct:
+                return
+            try:
+                data = response.json()
+                # Hledej pole s inzeráty – různé formáty
+                listings = None
+                if isinstance(data, dict):
+                    for key in ["data", "ads", "items", "results", "listings"]:
+                        v = data.get(key)
+                        if isinstance(v, list) and v:
+                            listings = v
+                            break
+                    # Zkus rekurzivně
+                    if not listings and "hits" in data:
+                        listings = data["hits"]
+                elif isinstance(data, list):
+                    listings = data
+
+                if listings:
+                    first = listings[0] if listings else {}
+                    # Zkontroluj že to jsou opravdové inzeráty
+                    if any(k in first for k in ["ad_id", "subject", "list_time", "price"]):
+                        captured.extend(listings)
+                        print(f"  ✓ API: {url[:80]}")
+                        print(f"    → {len(listings)} inzerátů, první klíče: {list(first.keys())[:6]}")
+            except Exception:
+                pass
 
         page.on("response", on_response)
 
-        print(f"  Načítám: {SEARCH_URL}")
+        print(f"  Načítám stránku...")
         page.goto(SEARCH_URL, timeout=45000)
-        page.wait_for_timeout(8000)  # Počkej na JS rendering
-
-        print(f"  Zachycené API URL ({len(api_urls)}): {api_urls[:3]}")
-        print(f"  Zachyceno inzerátů přes API: {len(captured)}")
-
-        # Záloha – extrahuj z DOM
-        if not captured:
-            print("  Zkouším DOM extrakci...")
-            try:
-                # Hledej JSON data v script tazích
-                scripts = page.eval_on_selector_all(
-                    "script[type='application/json'], script[id]",
-                    "els => els.map(e => e.textContent)"
-                )
-                for s in scripts:
-                    if "list_time" in s or "ad_id" in s:
-                        try:
-                            data = json.loads(s)
-                            if isinstance(data, dict) and "data" in data:
-                                captured.extend(data["data"])
-                                print(f"  DOM script: nalezeno {len(data['data'])} inzerátů")
-                                break
-                        except Exception:
-                            pass
-            except Exception as e:
-                print(f"  DOM extrakce selhala: {e}")
-
-            # Záloha 2 – extrahuj přímo z elementů na stránce
-            if not captured:
-                print("  Zkouším extrakci z HTML elementů...")
-                try:
-                    items = page.query_selector_all("article[data-cy], li[data-cy]")
-                    print(f"  Nalezeno article elementů: {len(items)}")
-                    for item in items[:5]:
-                        print(f"    - {item.get_attribute('data-cy')}: {item.inner_text()[:80]}")
-                except Exception as e:
-                    print(f"  Element extrakce: {e}")
+        page.wait_for_timeout(12000)
 
         browser.close()
+
+    print(f"  Celkem zachyceno: {len(captured)} inzerátů")
     return captured
 
 
@@ -197,7 +181,8 @@ def format_msg(listing):
     drivetrain = get_param(listing, "drivning", "drift") or "neuvedeno"
     loc = listing.get("location", [])
     location_str = ", ".join(
-        l.get("name", "") for l in (loc[:2] if isinstance(loc, list) else []) if isinstance(l, dict) and l.get("name")
+        l.get("name", "") for l in (loc[:2] if isinstance(loc, list) else [])
+        if isinstance(l, dict) and l.get("name")
     ) or "neuvedeno"
     url = listing.get("ad_link") or listing.get("share_url") or "https://www.blocket.se"
     note = analyze(listing, km, price)
