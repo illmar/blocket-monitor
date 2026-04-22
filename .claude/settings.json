@@ -1,0 +1,7 @@
+{
+  "sandbox": {
+    "network": {
+      "allowedDomains": ["*.blocket.se", "api.blocket.se", "api.telegram.org"]
+    }
+  }
+}
