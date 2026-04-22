@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Blocket.se Volvo V90 monitor – Playwright + JS extrakce."""
+"""Blocket.se Volvo V90 monitor – Playwright + GDPR consent."""
 
 import sys
 import json
@@ -29,108 +29,69 @@ def fetch_listings():
             locale="sv-SE",
             timezone_id="Europe/Stockholm",
             viewport={"width": 1280, "height": 800},
-            extra_http_headers={
-                "Accept-Language": "sv-SE,sv;q=0.9,en;q=0.8",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Sec-Fetch-Site": "none",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-User": "?1",
-                "Sec-Fetch-Dest": "document",
-            },
+            extra_http_headers={"Accept-Language": "sv-SE,sv;q=0.9,en;q=0.8"},
         )
-        # Skryj automatizaci
-        context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        """)
+        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
         page = context.new_page()
 
         captured = []
-        raw_responses = []
 
         def on_response(response):
-            url = response.url
-            if "blocket.se" not in url:
+            if "blocket.se" not in response.url:
                 return
             ct = response.headers.get("content-type", "")
-            if "json" in ct:
-                raw_responses.append(url)
-                try:
-                    data = response.json()
-                    # Prohledej libovolnou strukturu
-                    def find_listings(obj, depth=0):
-                        if depth > 5:
-                            return []
-                        if isinstance(obj, list) and len(obj) > 0:
-                            first = obj[0]
-                            if isinstance(first, dict) and any(k in first for k in ["ad_id","subject","list_time"]):
-                                return obj
-                        if isinstance(obj, dict):
-                            for v in obj.values():
-                                result = find_listings(v, depth+1)
-                                if result:
-                                    return result
+            if "json" not in ct:
+                return
+            try:
+                data = response.json()
+                def find_listings(obj, depth=0):
+                    if depth > 5:
                         return []
-                    found = find_listings(data)
-                    if found:
-                        captured.extend(found)
-                        print(f"  ✓ JSON: {url[:70]} → {len(found)} inzerátů")
-                except Exception:
-                    pass
+                    if isinstance(obj, list) and obj:
+                        first = obj[0]
+                        if isinstance(first, dict) and any(k in first for k in ["ad_id","subject","list_time"]):
+                            return obj
+                    if isinstance(obj, dict):
+                        for v in obj.values():
+                            r = find_listings(v, depth+1)
+                            if r:
+                                return r
+                    return []
+                found = find_listings(data)
+                if found:
+                    captured.extend(found)
+                    print(f"  ✓ {response.url[:70]} → {len(found)} inzerátů")
+            except Exception:
+                pass
 
         page.on("response", on_response)
 
-        # Přejdi nejprve na hlavní stránku
-        print("  Načítám homepage...")
-        page.goto("https://www.blocket.se/", wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(2000)
-
-        # Přejdi na vyhledávání
         search_url = "https://www.blocket.se/mobility/search/car?q=volvo+v90&year_min=2020&price_max=270000&fuel=bensin,laddhybrid&gearbox=automat&limit=60"
-        print(f"  Načítám výsledky...")
+        print("  Načítám blocket.se...")
         page.goto(search_url, wait_until="domcontentloaded", timeout=40000)
-        page.wait_for_timeout(10000)
 
-        print(f"  JSON odpovědi: {len(raw_responses)}: {raw_responses[:3]}")
-        print(f"  Zachyceno inzerátů: {len(captured)}")
-
-        # Záloha – extrahuj z DOM pomocí JS
-        if not captured:
-            print("  Zkouším JS window variables...")
-            for var in ["__INITIAL_STATE__", "__REDUX_STATE__", "__APP_STATE__", "__data__"]:
-                try:
-                    data = page.evaluate(f"window['{var}']")
-                    if data:
-                        print(f"  Nalezena proměnná {var}")
-                        break
-                except Exception:
-                    pass
-
-            # Hledej JSON v script tazích
-            print("  Hledám JSON v script tazích...")
-            try:
-                scripts = page.eval_on_selector_all("script", "els => els.map(e => ({type: e.type, id: e.id, len: e.textContent.length}))")
-                relevant = [s for s in scripts if s.get("len", 0) > 100]
-                print(f"  Script tagy ({len(relevant)}): {relevant[:5]}")
-
-                for i, s in enumerate(scripts):
-                    if s.get("len", 0) > 500:
-                        content = page.eval_on_selector_all("script", f"els => els[{i}] ? els[{i}].textContent : ''")
-                        if content and content[0] and ("list_time" in content[0] or "ad_id" in content[0]):
-                            try:
-                                data = json.loads(content[0])
-                                print(f"  ✓ Nalezena data ve script tagu!")
-                                captured.append(data)
-                            except Exception:
-                                pass
-            except Exception as e:
-                print(f"  JS chyba: {e}")
-
-        # Screenshot pro diagnostiku
+        # Akceptuj GDPR cookie dialog
         try:
-            page.screenshot(path="screenshot.png", full_page=False)
-            print("  Screenshot uložen")
+            btn = page.wait_for_selector("button:has-text('Godkänn alla')", timeout=8000)
+            if btn:
+                btn.click()
+                print("  ✓ GDPR dialog akceptován")
+                page.wait_for_timeout(5000)  # Počkej na načtení výsledků po souhlasu
+        except Exception:
+            print("  GDPR dialog nenalezen (možná již akceptován)")
+            page.wait_for_timeout(5000)
+
+        # Počkej na načtení výsledků
+        try:
+            page.wait_for_selector("article, [data-testid*='ad'], .listing", timeout=10000)
         except Exception:
             pass
+        page.wait_for_timeout(3000)
+
+        print(f"  Zachyceno inzerátů: {len(captured)}")
+
+        # Screenshot pro diagnostiku
+        page.screenshot(path="screenshot.png")
 
         browser.close()
     return captured
@@ -211,7 +172,7 @@ def analyze(listing, km, price):
         elif km < 80000:
             notes.append(f"Nízký nájezd ({km:,} km).".replace(",", " "))
         elif km > 115000:
-            notes.append(f"Vyšší nájezd — prověř servisní historii.")
+            notes.append("Vyšší nájezd — prověř servisní historii.")
     if "t8" in s or "recharge" in s:
         notes.append("T8 Recharge je nejsilnější varianta V90 s PHEV pohonem.")
     elif "t6" in s:
@@ -271,23 +232,22 @@ def main():
     try:
         listings = fetch_listings()
     except Exception as e:
-        print(f"Chyba načítání: {e}", file=sys.stderr)
+        print(f"Chyba: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Nalezeno: {len(listings)} | Po filtrech: {len([l for l in listings if matches(l)[0]])}")
     matching = [l for l in listings if matches(l)[0]]
     new = [l for l in matching if is_new(l)]
-    print(f"Nových (posledních {HOURS_WINDOW} h): {len(new)}")
+    print(f"Celkem: {len(listings)} | Filtr: {len(matching)} | Nové: {len(new)}")
 
     sent = 0
     for l in new:
         try:
             send_telegram(format_msg(l))
             sent += 1
-            print(f"  Odesláno: {l.get('subject')}")
+            print(f"  ✓ {l.get('subject')}")
         except Exception as e:
             print(f"  Telegram chyba: {e}", file=sys.stderr)
-    print(f"Odesláno notifikací: {sent}")
+    print(f"Odesláno: {sent}")
 
 
 if __name__ == "__main__":
