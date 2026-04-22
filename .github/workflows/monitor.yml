@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -20,12 +22,3 @@ jobs:
           playwright install-deps chromium
       - name: Run monitor
         run: python monitor.py
-      - name: Upload debug artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug
-          path: |
-            screenshot.png
-            page.html
-          if-no-files-found: ignore

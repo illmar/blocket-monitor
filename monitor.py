@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Blocket.se Volvo V90 monitor – requests + JSON-LD + seen_ids deduplication."""
+"""Blocket.se Volvo V90 monitor – Playwright pro Cloudflare, JSON-LD z HTML."""
 
 import re
 import sys
@@ -15,8 +15,6 @@ CHAT_ID = 5711350539
 SEK_TO_CZK = 2.27
 MIN_YEAR = 2020
 MAX_PRICE_SEK = 270000
-ACCEPTED_FUELS = ["bensin", "laddhybrid", "hybrid", "plug-in", "t5", "t6", "t8"]
-REJECTED_FUELS = ["diesel", "el ", "etanol", "gas", "d2", "d3", "d4", "d5"]
 
 SEARCH_URL = (
     "https://www.blocket.se/annonser/hela_sverige/fordon/bilar"
@@ -24,7 +22,7 @@ SEARCH_URL = (
 )
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "sv-SE,sv;q=0.9,en;q=0.8",
+    "Accept-Language": "sv-SE,sv;q=0.9",
 }
 SEEN_FILE = "seen_ids.json"
 
@@ -43,48 +41,74 @@ def save_seen_ids(ids):
         subprocess.run(["git", "config", "user.email", "monitor@blocket"], check=False)
         subprocess.run(["git", "config", "user.name", "Blocket Monitor"], check=False)
         subprocess.run(["git", "add", SEEN_FILE], check=False)
-        subprocess.run(["git", "commit", "-m", f"Update seen_ids ({len(ids)} IDs)"], check=False)
-        subprocess.run(["git", "push"], check=False)
+        r = subprocess.run(["git", "commit", "-m", f"seen_ids: {len(ids)} ID"], capture_output=True, check=False)
+        if r.returncode == 0:
+            subprocess.run(["git", "push"], check=False)
+            print(f"  seen_ids.json uložen ({len(ids)} ID)")
     except Exception as e:
-        print(f"  Git commit selhal: {e}")
+        print(f"  Git: {e}")
 
 
-def fetch_search_listings():
-    r = requests.get(SEARCH_URL, headers=HEADERS, timeout=30)
-    r.raise_for_status()
+def fetch_html_via_playwright():
+    """Playwright prochází Cloudflare – vrátí HTML stránky."""
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            user_agent=HEADERS["User-Agent"],
+            locale="sv-SE",
+            timezone_id="Europe/Stockholm",
+            viewport={"width": 1280, "height": 900},
+            extra_http_headers={"Accept-Language": "sv-SE,sv;q=0.9"},
+        )
+        context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+        page = context.new_page()
+        print(f"  Playwright: načítám stránku...")
+        page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=40000)
+        page.wait_for_timeout(3000)
+        html = page.content()
+        browser.close()
+    print(f"  HTML: {len(html)} znaků")
+    return html
+
+
+def parse_json_ld(html):
+    """Extrahuj inzeráty z JSON-LD (server-rendered, nezávisí na JS)."""
     scripts = re.findall(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        r.text, re.DOTALL
+        html, re.DOTALL
     )
     for s in scripts:
         try:
             data = json.loads(s)
             items = data.get("mainEntity", {}).get("itemListElement", [])
             if items:
+                print(f"  JSON-LD: {len(items)} inzerátů")
                 return items
         except Exception:
             pass
     return []
 
 
-def get_listing_detail(url):
-    """Stáhni stránku inzerátu a extrahuj rok a nájezd z <title>."""
+def get_detail(url):
+    """Fetch individual listing – extrahuj rok z <title>."""
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
         title_m = re.search(r'<title>([^<]+)</title>', r.text)
         if not title_m:
             return {}
         title = title_m.group(1)
-        # Formát: "... Volvo V90 ... - YYYY - Barva - NNN Hk - ..."
         year_m = re.search(r'\b(20[12]\d)\b', title)
         power_m = re.search(r'(\d+)\s*Hk', title, re.IGNORECASE)
-        # Hledej nájezd v meta description
+        # Nájezd v meta description
         desc_m = re.search(r'<meta[^>]+name="description"[^>]+content="([^"]*)"', r.text)
         mileage_km = None
         if desc_m:
-            # Hledej číslo + mil nebo km
-            mil_m = re.search(r'(\d[\d\s]+)\s*mil\b', desc_m.group(1), re.IGNORECASE)
-            km_m = re.search(r'(\d[\d\s]+)\s*km\b', desc_m.group(1), re.IGNORECASE)
+            mil_m = re.search(r'(\d[\d\s]+)\s*mil\b', desc_m.group(1))
+            km_m = re.search(r'(\d[\d\s]+)\s*km\b', desc_m.group(1))
             if mil_m:
                 mileage_km = int(re.sub(r'\s', '', mil_m.group(1))) * 10
             elif km_m:
@@ -100,45 +124,21 @@ def get_listing_detail(url):
 
 
 def parse_listing(item):
-    """Extrahuj data z JSON-LD položky."""
     it = item.get("item", {})
-    name = it.get("name", "Volvo V90")
-    model = it.get("model", "")
-    desc = it.get("description", "")
-    price = int(it.get("offers", {}).get("price", 0) or 0)
     url = it.get("url", "")
-    listing_id = re.search(r'/item/(\d+)', url)
-    listing_id = listing_id.group(1) if listing_id else None
+    lid = re.search(r'/item/(\d+)', url)
     return {
-        "id": listing_id,
-        "name": name,
-        "model": model,
-        "description": desc,
-        "price": price,
+        "id": lid.group(1) if lid else None,
+        "name": it.get("name", "Volvo V90"),
+        "description": it.get("description", ""),
+        "price": int(it.get("offers", {}).get("price", 0) or 0),
         "url": url,
     }
 
 
-def is_accepted_fuel(name, desc):
-    """Benzín nebo plug-in hybrid podle názvu/popisu."""
+def is_diesel(name, desc):
     text = (name + " " + desc).lower()
-    # Vyloučit diesel
-    if any(f in text for f in ["d2 ", "d3 ", "d4 ", "d5 ", " diesel", "tdi", "cdti"]):
-        return False
-    # Akceptovat bensin/hybrid
-    if any(f in text for f in ["t5", "t6", "t8", "recharge", "plug-in", "laddhybrid", "bensin"]):
-        return True
-    return None  # Neznámé – nevylučuj
-
-
-def is_automatic(desc):
-    """Automatická převodovka."""
-    text = desc.lower()
-    if any(t in text for t in ["geartronic", "automat", "automatic"]):
-        return True
-    if "manuell" in text or "manual" in text:
-        return False
-    return None  # Neznámé
+    return any(f in text for f in ["d2 ", "d3 ", "d4 ", "d5 ", " diesel"])
 
 
 def analyze(listing, detail):
@@ -163,44 +163,38 @@ def analyze(listing, detail):
         elif km > 120000:
             notes.append("Vyšší nájezd — prověř servisní historii.")
 
-    if "t8" in name or "recharge" in name or "t8" in desc or "recharge" in desc:
+    if "t8" in name + desc or "recharge" in name + desc:
         notes.append("T8 Recharge — nejsilnější V90 s PHEV pohonem.")
-    elif "t6" in name or "t6" in desc:
+    elif "t6" in name + desc:
         notes.append("T6 — silná benzínová verze.")
     if "cross country" in name:
         notes.append("Cross Country má vyšší světlou výšku.")
-    if "awd" in desc or "4wd" in desc or "awd" in name:
-        notes.append("Pohon AWD — výhoda pro zimní provoz.")
+    if "awd" in name + desc:
+        notes.append("Pohon AWD.")
 
     return " ".join(notes[:3]) or "Nabídka splňuje zadaná kritéria."
 
 
 def format_msg(listing, detail):
-    name = listing["name"]
     price = listing["price"]
-    desc = listing["description"]
-    url = listing["url"]
-
     price_sek = f"{price:,}".replace(",", " ") if price else "neuvedeno"
     price_czk = f"{round(price * SEK_TO_CZK / 1000) * 1000:,}".replace(",", " ") if price else "—"
-
     year = detail.get("year", "neuvedeno")
     power = detail.get("power_hk")
     km = detail.get("mileage_km")
     mileage_str = f"{km:,} km".replace(",", " ") if km else "neuvedeno"
-    motor_str = f"{desc}"
+    spec = listing["description"]
     if power:
-        motor_str = f"{desc} ({power} Hk)"
+        spec += f" ({power} Hk)"
     note = analyze(listing, detail)
-
     return (
-        f"🚗 <b>{name}</b>\n\n"
+        f"🚗 <b>{listing['name']}</b>\n\n"
         f"💰 <b>Cena:</b> {price_sek} SEK (~{price_czk} CZK)\n"
         f"📅 <b>Rok výroby:</b> {year}\n"
         f"🛣️ <b>Nájezd:</b> {mileage_str}\n"
-        f"⚙️ <b>Specifikace:</b> {motor_str}\n\n"
+        f"⚙️ <b>Specifikace:</b> {spec}\n\n"
         f"💡 <b>Hodnocení:</b> {note}\n\n"
-        f'🔗 <a href="{url}">Zobrazit inzerát</a>'
+        f'🔗 <a href="{listing["url"]}">Zobrazit inzerát</a>'
     )
 
 
@@ -216,16 +210,12 @@ def send_telegram(text):
 def main():
     print(f"UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # Načti inzeráty
-    try:
-        items = fetch_search_listings()
-    except Exception as e:
-        print(f"Chyba načítání: {e}", file=sys.stderr)
+    html = fetch_html_via_playwright()
+    items = parse_json_ld(html)
+    if not items:
+        print("Žádné inzeráty v JSON-LD.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Nalezeno: {len(items)} inzerátů")
-
-    # Načti viděné ID
     seen_ids = load_seen_ids()
     print(f"Uložených ID: {len(seen_ids)}")
 
@@ -237,47 +227,41 @@ def main():
         lid = listing["id"]
         if not lid:
             continue
-
         new_ids.add(lid)
 
         if lid in seen_ids:
             continue
 
-        # Nový inzerát — zkontroluj filtry
-        price = listing["price"]
-        if price > MAX_PRICE_SEK:
-            print(f"  Vyřazen (cena {price}): {listing['name']}")
+        # Vyřaď diesel
+        if is_diesel(listing["name"], listing["description"]):
+            print(f"  Diesel vyřazen: {listing['name']}")
             continue
 
-        fuel_ok = is_accepted_fuel(listing["name"], listing["description"])
-        if fuel_ok is False:
-            print(f"  Vyřazen (palivo): {listing['name']} – {listing['description'][:50]}")
+        # Cena
+        if listing["price"] > MAX_PRICE_SEK:
             continue
 
-        # Stáhni detail pro rok
-        print(f"  Nový: {listing['name']} – {price:,} SEK".replace(",", " "))
-        detail = get_listing_detail(listing["url"])
+        # Detail stránky (rok)
+        print(f"  Nový: {listing['name']} – {listing['price']:,} SEK".replace(",", " "))
+        detail = get_detail(listing["url"])
 
         year = detail.get("year")
         if year and year < MIN_YEAR:
-            print(f"    Vyřazen (rok {year} < {MIN_YEAR})")
+            print(f"    Vyřazen rok {year}")
             continue
 
-        # Pošli notifikaci
         try:
             send_telegram(format_msg(listing, detail))
             sent += 1
-            print(f"    ✓ Telegram odesláno")
+            print(f"    ✓ Odesláno")
         except Exception as e:
-            print(f"    Telegram chyba: {e}", file=sys.stderr)
+            print(f"    Telegram: {e}", file=sys.stderr)
 
-    # Aktualizuj seen_ids
-    updated_ids = seen_ids | new_ids
-    if updated_ids != seen_ids:
-        save_seen_ids(updated_ids)
-        print(f"Uloženo {len(updated_ids)} ID")
+    updated = seen_ids | new_ids
+    if updated != seen_ids:
+        save_seen_ids(updated)
 
-    print(f"Odesláno notifikací: {sent}")
+    print(f"Celkem: {len(items)} | Nových: {len(new_ids - seen_ids)} | Odesláno: {sent}")
 
 
 if __name__ == "__main__":
