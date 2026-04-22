@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Blocket.se Volvo V90 monitor – Playwright + GDPR consent."""
+"""Blocket.se Volvo V90 monitor – DOM extrakce po GDPR souhlasu."""
 
 import sys
 import json
+import re
 from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = "8796100241:AAHZpaeWLqHAEZX6Sa855sNhapO3g1LIZUA"
@@ -14,6 +15,11 @@ MAX_PRICE_SEK = 270000
 MAX_MILEAGE_KM = 140000
 ACCEPTED_FUELS = ["bensin", "laddhybrid", "hybrid", "el/bensin", "bensin/el", "plug-in"]
 ACCEPTED_TRANSMISSIONS = ["automat", "automatisk", "geartronic"]
+
+SEARCH_URL = (
+    "https://www.blocket.se/annonser/hela_sverige/fordon/bilar"
+    "?q=volvo+v90&mj=2020&xp=270000&cg=1020&ca=11"
+)
 
 
 def fetch_listings():
@@ -28,14 +34,14 @@ def fetch_listings():
             user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             locale="sv-SE",
             timezone_id="Europe/Stockholm",
-            viewport={"width": 1280, "height": 800},
+            viewport={"width": 1280, "height": 900},
             extra_http_headers={"Accept-Language": "sv-SE,sv;q=0.9,en;q=0.8"},
         )
         context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
         page = context.new_page()
 
+        # Zachyť JSON inzeráty z API
         captured = []
-
         def on_response(response):
             if "blocket.se" not in response.url:
                 return
@@ -44,54 +50,56 @@ def fetch_listings():
                 return
             try:
                 data = response.json()
-                def find_listings(obj, depth=0):
-                    if depth > 5:
-                        return []
+                def find_ads(obj, depth=0):
+                    if depth > 5: return []
                     if isinstance(obj, list) and obj:
-                        first = obj[0]
-                        if isinstance(first, dict) and any(k in first for k in ["ad_id","subject","list_time"]):
+                        if isinstance(obj[0], dict) and any(k in obj[0] for k in ["ad_id","subject","list_time"]):
                             return obj
                     if isinstance(obj, dict):
                         for v in obj.values():
-                            r = find_listings(v, depth+1)
-                            if r:
-                                return r
+                            r = find_ads(v, depth+1)
+                            if r: return r
                     return []
-                found = find_listings(data)
+                found = find_ads(data)
                 if found:
                     captured.extend(found)
-                    print(f"  ✓ {response.url[:70]} → {len(found)} inzerátů")
+                    print(f"  ✓ API: {len(found)} inzerátů z {response.url[:60]}")
             except Exception:
                 pass
 
         page.on("response", on_response)
 
-        search_url = "https://www.blocket.se/mobility/search/car?q=volvo+v90&year_min=2020&price_max=270000&fuel=bensin,laddhybrid&gearbox=automat&limit=60"
-        print("  Načítám blocket.se...")
-        page.goto(search_url, wait_until="domcontentloaded", timeout=40000)
+        print(f"  Načítám: {SEARCH_URL[:60]}...")
+        page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=40000)
 
-        # Akceptuj GDPR cookie dialog
-        try:
-            btn = page.wait_for_selector("button:has-text('Godkänn alla')", timeout=8000)
-            if btn:
-                btn.click()
-                print("  ✓ GDPR dialog akceptován")
-                page.wait_for_timeout(5000)  # Počkej na načtení výsledků po souhlasu
-        except Exception:
-            print("  GDPR dialog nenalezen (možná již akceptován)")
-            page.wait_for_timeout(5000)
+        # Akceptuj GDPR dialog
+        for selector in [
+            "button:has-text('Godkänn alla')",
+            "button:has-text('Accept all')",
+            "[id*='accept'] button",
+            ".sp-message-container button:first-child",
+        ]:
+            try:
+                btn = page.wait_for_selector(selector, timeout=5000)
+                if btn:
+                    btn.click()
+                    print(f"  ✓ GDPR akceptován ({selector})")
+                    break
+            except Exception:
+                pass
 
-        # Počkej na načtení výsledků
-        try:
-            page.wait_for_selector("article, [data-testid*='ad'], .listing", timeout=10000)
-        except Exception:
-            pass
-        page.wait_for_timeout(3000)
+        # Čekej na výsledky
+        page.wait_for_timeout(8000)
 
-        print(f"  Zachyceno inzerátů: {len(captured)}")
-
-        # Screenshot pro diagnostiku
+        # Screenshot
         page.screenshot(path="screenshot.png")
+        print(f"  API výsledky: {len(captured)}")
+
+        # Ulož HTML pro analýzu
+        html = page.content()
+        with open("page.html", "w") as f:
+            f.write(html)
+        print(f"  HTML uložen ({len(html)} znaků)")
 
         browser.close()
     return captured
@@ -154,36 +162,6 @@ def matches(listing):
     return True, "OK"
 
 
-def analyze(listing, km, price):
-    notes = []
-    s = listing.get("subject", "").lower()
-    if price:
-        if price < 210000:
-            notes.append("Cena výrazně pod průměrem trhu.")
-        elif price < 245000:
-            notes.append("Velmi dobrá cena pro tento model.")
-        elif price < 265000:
-            notes.append("Cena odpovídá tržní hodnotě.")
-        else:
-            notes.append("Cena na horní hranici — zkontroluj výbavu.")
-    if km:
-        if km < 50000:
-            notes.append(f"Výjimečně nízký nájezd ({km:,} km).".replace(",", " "))
-        elif km < 80000:
-            notes.append(f"Nízký nájezd ({km:,} km).".replace(",", " "))
-        elif km > 115000:
-            notes.append("Vyšší nájezd — prověř servisní historii.")
-    if "t8" in s or "recharge" in s:
-        notes.append("T8 Recharge je nejsilnější varianta V90 s PHEV pohonem.")
-    elif "t6" in s:
-        notes.append("T6 nabízí solidní výkon.")
-    if "cross country" in s:
-        notes.append("Cross Country má vyšší světlou výšku.")
-    if "awd" in s or "4wd" in s:
-        notes.append("Pohon AWD — výhoda pro zimní provoz.")
-    return " ".join(notes[:3]) or "Nabídka splňuje zadaná kritéria."
-
-
 def format_msg(listing):
     subject = listing.get("subject", "Volvo V90")
     price = (listing.get("price") or {}).get("value", 0)
@@ -202,7 +180,19 @@ def format_msg(listing):
         if isinstance(l, dict) and l.get("name")
     ) or "neuvedeno"
     url = listing.get("ad_link") or listing.get("share_url") or "https://www.blocket.se"
-    note = analyze(listing, km, price)
+    s = listing.get("subject", "").lower()
+    notes = []
+    if price < 210000:
+        notes.append("Cena výrazně pod průměrem trhu.")
+    elif price < 245000:
+        notes.append("Velmi dobrá cena.")
+    if km and km < 60000:
+        notes.append(f"Nízký nájezd ({km:,} km).".replace(",", " "))
+    if "t8" in s or "recharge" in s:
+        notes.append("T8 Recharge — nejsilnější V90 s PHEV pohonem.")
+    if "cross country" in s:
+        notes.append("Cross Country má vyšší světlou výšku.")
+    note = " ".join(notes) or "Nabídka splňuje kritéria."
     return (
         f"🚗 <b>{subject}</b>\n\n"
         f"💰 <b>Cena:</b> {price_sek} SEK (~{price_czk} CZK)\n"
