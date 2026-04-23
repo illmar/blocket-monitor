@@ -162,6 +162,8 @@ def main() -> None:
         new_ids.add(listing["id"])
         if listing["id"] in seen:
             continue
+        if not re.search(r'\bV90\b', listing["name"] + " " + listing["description"], re.IGNORECASE):
+            continue
 
         is_diesel = bool(DIESEL_RE.search(listing["name"] + " " + listing["description"]))
         if is_diesel and listing["price"] > MAX_PRICE_DIESEL_SEK:
