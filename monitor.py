@@ -17,9 +17,11 @@ FIRECRAWL_API_KEY = os.environ["FIRECRAWL_API_KEY"]
 SEK_TO_CZK = 2.27
 MIN_YEAR = 2020
 MAX_PRICE_SEK = 270000
+MAX_PRICE_DIESEL_SEK = 300000
+MAX_MILEAGE_DIESEL_KM = 100000
 SEARCH_URL = (
     "https://www.blocket.se/annonser/hela_sverige/fordon/bilar"
-    "?q=volvo+v90&mj=2020&xp=270000&cg=1020&ca=11"
+    "?q=volvo+v90&mj=2020&xp=300000&cg=1020&ca=11"
 )
 SEEN_FILE = Path("seen_ids.json")
 DIESEL_RE = re.compile(r'\b(d[2-5]|diesel|tdi|cdti)\b', re.IGNORECASE)
@@ -160,13 +162,17 @@ def main() -> None:
         new_ids.add(listing["id"])
         if listing["id"] in seen:
             continue
-        if DIESEL_RE.search(listing["name"] + " " + listing["description"]):
+
+        is_diesel = bool(DIESEL_RE.search(listing["name"] + " " + listing["description"]))
+        if is_diesel and listing["price"] > MAX_PRICE_DIESEL_SEK:
             continue
-        if listing["price"] > MAX_PRICE_SEK:
+        if not is_diesel and listing["price"] > MAX_PRICE_SEK:
             continue
 
         detail = fetch_detail(listing["url"])
         if (y := detail.get("year")) and y < MIN_YEAR:
+            continue
+        if is_diesel and (km := detail.get("mileage_km")) and km > MAX_MILEAGE_DIESEL_KM:
             continue
 
         try:
