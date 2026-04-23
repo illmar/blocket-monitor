@@ -16,6 +16,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Sync with remote
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git rebase origin/main
       - name: Install dependencies
         run: pip install requests
       - name: Run monitor
@@ -26,12 +32,6 @@ jobs:
         run: python monitor.py
       - name: Commit seen IDs
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git stash
-          git fetch origin main
-          git rebase origin/main
-          git stash pop
           git add seen_ids.json
           git diff --cached --quiet || git commit -m "chore: update seen_ids"
           git push
