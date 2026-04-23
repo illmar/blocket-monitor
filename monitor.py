@@ -71,13 +71,8 @@ def fetch_detail(url: str) -> dict:
     desc = (re.search(r'<meta[^>]+name="description"[^>]+content="([^"]*)"', html) or [None, ""])[1]
     year = (re.search(r"\b(20[12]\d)\b", title) or [None, None])[1]
     power = (re.search(r"(\d+)\s*Hk", title, re.IGNORECASE) or [None, None])[1]
-    mil_m = re.search(r"(\d[\d\s]+)\s*mil\b", desc)
-    km_m = re.search(r"(\d[\d\s]+)\s*km\b", desc)
-    mileage = None
-    if mil_m:
-        mileage = int(re.sub(r"\s", "", mil_m.group(1))) * 10
-    elif km_m:
-        mileage = int(re.sub(r"\s", "", km_m.group(1)))
+    mil_m = re.search(r'"key":"mileage","value":\["(\d+)"\]', html)
+    mileage = int(mil_m.group(1)) * 10 if mil_m else None
     return {
         "year": int(year) if year else None,
         "power_hk": int(power) if power else None,
