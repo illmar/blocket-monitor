@@ -30,4 +30,4 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add seen_ids.json
           git diff --cached --quiet || git commit -m "chore: update seen_ids"
-          git push
+          git pull --rebase && git push
