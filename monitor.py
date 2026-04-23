@@ -19,6 +19,7 @@ MIN_YEAR = 2020
 MAX_PRICE_SEK = 270000
 MAX_PRICE_DIESEL_SEK = 300000
 MAX_MILEAGE_DIESEL_KM = 100000
+MAX_MILEAGE_PETROL_KM = 120000
 SEARCH_URL = (
     "https://www.blocket.se/annonser/hela_sverige/fordon/bilar"
     "?q=volvo+v90&mj=2020&xp=300000&cg=1020&ca=11"
@@ -116,7 +117,7 @@ def analyze(listing: dict, detail: dict) -> str:
     return " ".join(notes[:3]) or "Nabídka splňuje zadaná kritéria."
 
 
-def format_msg(listing: dict, detail: dict) -> str:
+def format_msg(listing: dict, detail: dict, is_diesel: bool = False) -> str:
     price = listing["price"]
     price_sek = f"{price:,}".replace(",", " ") if price else "neuvedeno"
     price_czk = f"{round(price * SEK_TO_CZK / 1000) * 1000:,}".replace(",", " ") if price else "—"
@@ -125,11 +126,13 @@ def format_msg(listing: dict, detail: dict) -> str:
     spec = listing["description"]
     if power := detail.get("power_hk"):
         spec += f" ({power} Hk)"
+    fuel = "Diesel" if is_diesel else "Benzín"
     return (
         f"🚗 <b>{listing['name']}</b>\n\n"
         f"💰 <b>Cena:</b> {price_sek} SEK (~{price_czk} CZK)\n"
         f"📅 <b>Rok výroby:</b> {detail.get('year', 'neuvedeno')}\n"
         f"🛣️ <b>Nájezd:</b> {km_str}\n"
+        f"⛽ <b>Palivo:</b> {fuel}\n"
         f"⚙️ <b>Specifikace:</b> {spec}\n\n"
         f"💡 <b>Hodnocení:</b> {analyze(listing, detail)}\n\n"
         f'🔗 <a href="{listing["url"]}">Zobrazit inzerát</a>'
@@ -176,9 +179,11 @@ def main() -> None:
             continue
         if is_diesel and (km := detail.get("mileage_km")) and km > MAX_MILEAGE_DIESEL_KM:
             continue
+        if not is_diesel and (km := detail.get("mileage_km")) and km > MAX_MILEAGE_PETROL_KM:
+            continue
 
         try:
-            send_telegram(format_msg(listing, detail))
+            send_telegram(format_msg(listing, detail, is_diesel))
             sent += 1
             print(f"  ✓ {listing['name']} – {listing['price']:,} SEK".replace(",", " "))
         except Exception as e:
